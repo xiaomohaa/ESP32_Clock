@@ -46,10 +46,30 @@ static int s_retry_count = 0;
 I2cMasterBus user_i2cbus(7, 8, 0);
 DisplayPort *user_display = NULL;
 
-static lv_obj_t *time_label;
-static lv_obj_t *sec_label;
-static lv_obj_t *date_label;
-static lv_obj_t *weekday_label;
+/* time canvas: 240x80, rendered at 48px, zoomed for large display */
+#define TC_W  240
+#define TC_H  80
+static lv_color_t tc_buf[TC_W * TC_H];
+static lv_obj_t *time_canvas;
+
+/* seconds canvas: 80x80 */
+#define SC_W  80
+#define SC_H  80
+static lv_color_t sc_buf[SC_W * SC_H];
+static lv_obj_t *sec_canvas;
+
+/* date canvas: 240x50 */
+#define DC_W  240
+#define DC_H  50
+static lv_color_t dc_buf[DC_W * DC_H];
+static lv_obj_t *date_canvas;
+
+/* weekday canvas: 200x40 */
+#define WC_W  200
+#define WC_H  40
+static lv_color_t wc_buf[WC_W * WC_H];
+static lv_obj_t *weekday_canvas;
+
 static lv_obj_t *wifi_label;
 static lv_obj_t *battery_canvas;
 static lv_obj_t *battery_pct_label;
@@ -211,18 +231,43 @@ static const char *weekday_en(int wday)
     return (wday >= 0 && wday <= 6) ? names[wday] : "???";
 }
 
-static void set_rainbow_text(lv_obj_t *lbl, const char *text, int shift)
+static void draw_rainbow_on_canvas(lv_obj_t *canvas, const lv_font_t *font,
+                                   lv_coord_t w, const char *text, int shift)
 {
-    char buf[256];
-    int off = 0;
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
+
     int len = strlen(text);
-    for (int i = 0; i < len && off < (int)sizeof(buf) - 20; i++) {
-        int ci = (i + shift) % RAINBOW_N;
-        off += snprintf(buf + off, sizeof(buf) - off,
-                        "#%s %c# ", s_rainbow_hex[ci], text[i]);
+
+    /* measure total width */
+    lv_coord_t total_w = 0;
+    for (int i = 0; i < len; i++) {
+        char ch[2] = { text[i], '\0' };
+        lv_point_t sz;
+        lv_txt_get_size(&sz, ch, font, 0, 0, w, LV_TEXT_FLAG_NONE);
+        total_w += sz.x;
     }
-    buf[off] = '\0';
-    lv_label_set_text(lbl, buf);
+
+    /* center horizontally */
+    lv_coord_t char_x = (w - total_w) / 2;
+
+    for (int i = 0; i < len; i++) {
+        int ci = (i + shift) % RAINBOW_N;
+        lv_color_t color = lv_color_hex(
+            strtol(s_rainbow_hex[ci], NULL, 16));
+
+        char ch[2] = { text[i], '\0' };
+        lv_point_t sz;
+        lv_txt_get_size(&sz, ch, font, 0, 0, w, LV_TEXT_FLAG_NONE);
+
+        lv_draw_label_dsc_t dsc;
+        lv_draw_label_dsc_init(&dsc);
+        dsc.color = color;
+        dsc.opa   = LV_OPA_COVER;
+        dsc.font  = font;
+        lv_canvas_draw_text(canvas, char_x, 0, w, &dsc, ch);
+
+        char_x += sz.x;
+    }
 }
 
 static void clock_update_cb(lv_timer_t *timer)
@@ -233,26 +278,41 @@ static void clock_update_cb(lv_timer_t *timer)
     localtime_r(&now, &ti);
 
     if (s_time_synced) {
-        char tbuf[16], sbuf[8];
-        snprintf(tbuf, sizeof(tbuf), "%02d:%02d", ti.tm_hour, ti.tm_min);
+        char tbuf[8];
+        snprintf(tbuf, sizeof(tbuf), "%02d : %02d", ti.tm_hour, ti.tm_min);
+        draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, ti.tm_sec);
+
+        char sbuf[4];
         snprintf(sbuf, sizeof(sbuf), "%02d", ti.tm_sec);
-        set_rainbow_text(time_label, tbuf, ti.tm_sec);
-        set_rainbow_text(sec_label, sbuf, ti.tm_sec);
-        lv_label_set_text_fmt(date_label, "%04d-%02d-%02d",
-                              ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
-        lv_label_set_text(weekday_label, weekday_en(ti.tm_wday));
+        draw_rainbow_on_canvas(sec_canvas, &lv_font_montserrat_48, SC_W, sbuf, ti.tm_sec);
+
+        char dbuf[40];
+        snprintf(dbuf, sizeof(dbuf), "%04d-%02d-%02d",
+                 ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+        draw_rainbow_on_canvas(date_canvas, &lv_font_montserrat_22, DC_W, dbuf, ti.tm_sec);
+
+        draw_rainbow_on_canvas(weekday_canvas, &lv_font_montserrat_16, WC_W,
+                               weekday_en(ti.tm_wday), ti.tm_sec);
     } else {
         int total_sec = (int)(esp_timer_get_time() / 1000000);
         int sec = total_sec % 60;
-        char tbuf[16], sbuf[8];
+        char tbuf[16];
         snprintf(tbuf, sizeof(tbuf), "%02d:%02d",
                  total_sec / 3600, (total_sec % 3600) / 60);
+        draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, sec);
+
+        char sbuf[4];
         snprintf(sbuf, sizeof(sbuf), "%02d", sec);
-        set_rainbow_text(time_label, tbuf, sec);
-        set_rainbow_text(sec_label, sbuf, sec);
-        lv_label_set_text(date_label, "--");
-        lv_label_set_text(weekday_label, "--");
+        draw_rainbow_on_canvas(sec_canvas, &lv_font_montserrat_48, SC_W, sbuf, sec);
+
+        draw_rainbow_on_canvas(date_canvas, &lv_font_montserrat_22, DC_W, "--", sec);
+        draw_rainbow_on_canvas(weekday_canvas, &lv_font_montserrat_16, WC_W, "--", sec);
     }
+
+    lv_obj_invalidate(time_canvas);
+    lv_obj_invalidate(sec_canvas);
+    lv_obj_invalidate(date_canvas);
+    lv_obj_invalidate(weekday_canvas);
 }
 
 static void battery_canvas_redraw(int pct)
@@ -363,43 +423,37 @@ static void clock_ui_init(void)
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_make(0x10, 0x10, 0x10), 0);
 
-    /* time: Montserrat 48, rainbow recolor, no shadow */
-    time_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_48, 0);
-    lv_label_set_recolor(time_label, true);
-    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
-    lv_label_set_text(time_label, "00:00");
-    lv_obj_align(time_label, LV_ALIGN_CENTER, 0, -60);
+    /* time: canvas 240x80 rendered at 48px, zoomed for large display */
+    time_canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(time_canvas, tc_buf, TC_W, TC_H, LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_fill_bg(time_canvas, lv_color_black(), LV_OPA_COVER);
+    lv_img_set_zoom(time_canvas, 660);
+    lv_img_set_pivot(time_canvas, 0, 0);
+    lv_obj_align(time_canvas, LV_ALIGN_CENTER, -240, -70);
 
-    /* seconds: Montserrat 20, rainbow recolor, right of time */
-    sec_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(sec_label, &lv_font_montserrat_20, 0);
-    lv_label_set_recolor(sec_label, true);
-    lv_obj_set_style_text_color(sec_label, lv_color_white(), 0);
-    lv_label_set_text(sec_label, "00");
-    lv_obj_align_to(sec_label, time_label, LV_ALIGN_OUT_RIGHT_MID, 24, 8);
+    /* seconds: canvas 80x80, Montserrat 48, zoomed to match time height */
+    sec_canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(sec_canvas, sc_buf, SC_W, SC_H, LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_fill_bg(sec_canvas, lv_color_black(), LV_OPA_COVER);
+    lv_img_set_zoom(sec_canvas, 350);
+    lv_img_set_pivot(sec_canvas, 0, 0);
+    lv_obj_align(sec_canvas, LV_ALIGN_CENTER, 180, -20);
 
-    /* date: glow */
-    date_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(date_label, lv_color_white(), 0);
-    lv_obj_set_style_shadow_color(date_label, lv_color_make(0x40, 0x80, 0xFF), 0);
-    lv_obj_set_style_shadow_width(date_label, 15, 0);
-    lv_obj_set_style_shadow_spread(date_label, 3, 0);
-    lv_obj_set_style_shadow_opa(date_label, LV_OPA_40, 0);
-    lv_label_set_text(date_label, "--");
-    lv_obj_align_to(date_label, sec_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    /* date: canvas 240x50, Montserrat 22, zoomed */
+    date_canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(date_canvas, dc_buf, DC_W, DC_H, LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_fill_bg(date_canvas, lv_color_black(), LV_OPA_COVER);
+    lv_img_set_zoom(date_canvas, 400);
+    lv_img_set_pivot(date_canvas, 0, 0);
+    lv_obj_align(date_canvas, LV_ALIGN_CENTER, -60, 150);
 
-    /* weekday: English, glow */
-    weekday_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(weekday_label, lv_color_make(0xCC, 0xCC, 0xCC), 0);
-    lv_obj_set_style_shadow_color(weekday_label, lv_color_make(0x40, 0x80, 0xFF), 0);
-    lv_obj_set_style_shadow_width(weekday_label, 10, 0);
-    lv_obj_set_style_shadow_spread(weekday_label, 2, 0);
-    lv_obj_set_style_shadow_opa(weekday_label, LV_OPA_30, 0);
-    lv_label_set_text(weekday_label, "--");
-    lv_obj_align_to(weekday_label, date_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    /* weekday: canvas 200x40, Montserrat 16, zoomed */
+    weekday_canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(weekday_canvas, wc_buf, WC_W, WC_H, LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_fill_bg(weekday_canvas, lv_color_black(), LV_OPA_COVER);
+    lv_img_set_zoom(weekday_canvas, 400);
+    lv_img_set_pivot(weekday_canvas, 0, 0);
+    lv_obj_align(weekday_canvas, LV_ALIGN_CENTER, -60, 180);
 
     /* Right side: percentage | battery | WiFi (right to left) */
     /* Battery percentage (fixed right margin, Montserrat 22, faux-bold) */
