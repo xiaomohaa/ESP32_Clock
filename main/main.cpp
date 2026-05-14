@@ -232,7 +232,8 @@ static const char *weekday_en(int wday)
 }
 
 static void draw_rainbow_on_canvas(lv_obj_t *canvas, const lv_font_t *font,
-                                   lv_coord_t w, const char *text, int shift)
+                                   lv_coord_t w, const char *text,
+                                   int shift, bool bold)
 {
     lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
 
@@ -250,23 +251,28 @@ static void draw_rainbow_on_canvas(lv_obj_t *canvas, const lv_font_t *font,
     /* center horizontally */
     lv_coord_t char_x = (w - total_w) / 2;
 
-    for (int i = 0; i < len; i++) {
-        int ci = (i + shift) % RAINBOW_N;
-        lv_color_t color = lv_color_hex(
-            strtol(s_rainbow_hex[ci], NULL, 16));
+    /* draw twice with 1px offset for faux-bold */
+    int passes = bold ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
+        lv_coord_t px = char_x + (bold ? pass : 0);
+        for (int i = 0; i < len; i++) {
+            int ci = (i + shift) % RAINBOW_N;
+            lv_color_t color = lv_color_hex(
+                strtol(s_rainbow_hex[ci], NULL, 16));
 
-        char ch[2] = { text[i], '\0' };
-        lv_point_t sz;
-        lv_txt_get_size(&sz, ch, font, 0, 0, w, LV_TEXT_FLAG_NONE);
+            char ch[2] = { text[i], '\0' };
+            lv_point_t sz;
+            lv_txt_get_size(&sz, ch, font, 0, 0, w, LV_TEXT_FLAG_NONE);
 
-        lv_draw_label_dsc_t dsc;
-        lv_draw_label_dsc_init(&dsc);
-        dsc.color = color;
-        dsc.opa   = LV_OPA_COVER;
-        dsc.font  = font;
-        lv_canvas_draw_text(canvas, char_x, 0, w, &dsc, ch);
+            lv_draw_label_dsc_t dsc;
+            lv_draw_label_dsc_init(&dsc);
+            dsc.color = color;
+            dsc.opa   = LV_OPA_COVER;
+            dsc.font  = font;
+            lv_canvas_draw_text(canvas, px, 0, w, &dsc, ch);
 
-        char_x += sz.x;
+            px += sz.x;
+        }
     }
 }
 
@@ -280,33 +286,33 @@ static void clock_update_cb(lv_timer_t *timer)
     if (s_time_synced) {
         char tbuf[8];
         snprintf(tbuf, sizeof(tbuf), "%02d : %02d", ti.tm_hour, ti.tm_min);
-        draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, ti.tm_sec);
+        draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, ti.tm_sec, false);
 
         char sbuf[4];
         snprintf(sbuf, sizeof(sbuf), "%02d", ti.tm_sec);
-        draw_rainbow_on_canvas(sec_canvas, &lv_font_montserrat_48, SC_W, sbuf, ti.tm_sec);
+        draw_rainbow_on_canvas(sec_canvas, &lv_font_montserrat_48, SC_W, sbuf, ti.tm_sec, false);
 
         char dbuf[40];
         snprintf(dbuf, sizeof(dbuf), "%04d-%02d-%02d",
                  ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
-        draw_rainbow_on_canvas(date_canvas, &lv_font_montserrat_22, DC_W, dbuf, ti.tm_sec);
+        draw_rainbow_on_canvas(date_canvas, &lv_font_montserrat_22, DC_W, dbuf, ti.tm_sec, true);
 
         draw_rainbow_on_canvas(weekday_canvas, &lv_font_montserrat_16, WC_W,
-                               weekday_en(ti.tm_wday), ti.tm_sec);
+                               weekday_en(ti.tm_wday), ti.tm_sec, true);
     } else {
         int total_sec = (int)(esp_timer_get_time() / 1000000);
         int sec = total_sec % 60;
         char tbuf[16];
         snprintf(tbuf, sizeof(tbuf), "%02d:%02d",
                  total_sec / 3600, (total_sec % 3600) / 60);
-        draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, sec);
+        draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, sec, false);
 
         char sbuf[4];
         snprintf(sbuf, sizeof(sbuf), "%02d", sec);
-        draw_rainbow_on_canvas(sec_canvas, &lv_font_montserrat_48, SC_W, sbuf, sec);
+        draw_rainbow_on_canvas(sec_canvas, &lv_font_montserrat_48, SC_W, sbuf, sec, false);
 
-        draw_rainbow_on_canvas(date_canvas, &lv_font_montserrat_22, DC_W, "--", sec);
-        draw_rainbow_on_canvas(weekday_canvas, &lv_font_montserrat_16, WC_W, "--", sec);
+        draw_rainbow_on_canvas(date_canvas, &lv_font_montserrat_22, DC_W, "--", sec, true);
+        draw_rainbow_on_canvas(weekday_canvas, &lv_font_montserrat_16, WC_W, "--", sec, true);
     }
 
     lv_obj_invalidate(time_canvas);
@@ -421,7 +427,7 @@ static void status_bar_update_cb(lv_timer_t *timer)
 static void clock_ui_init(void)
 {
     lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_make(0x10, 0x10, 0x10), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
     /* time: canvas 240x80 rendered at 48px, zoomed for large display */
     time_canvas = lv_canvas_create(scr);
@@ -445,7 +451,7 @@ static void clock_ui_init(void)
     lv_canvas_fill_bg(date_canvas, lv_color_black(), LV_OPA_COVER);
     lv_img_set_zoom(date_canvas, 400);
     lv_img_set_pivot(date_canvas, 0, 0);
-    lv_obj_align(date_canvas, LV_ALIGN_CENTER, -60, 150);
+    lv_obj_align(date_canvas, LV_ALIGN_CENTER, -60, 160);
 
     /* weekday: canvas 200x40, Montserrat 16, zoomed */
     weekday_canvas = lv_canvas_create(scr);
@@ -453,7 +459,7 @@ static void clock_ui_init(void)
     lv_canvas_fill_bg(weekday_canvas, lv_color_black(), LV_OPA_COVER);
     lv_img_set_zoom(weekday_canvas, 400);
     lv_img_set_pivot(weekday_canvas, 0, 0);
-    lv_obj_align(weekday_canvas, LV_ALIGN_CENTER, -60, 180);
+    lv_obj_align(weekday_canvas, LV_ALIGN_CENTER, -50, 200);
 
     /* Right side: percentage | battery | WiFi (right to left) */
     /* Battery percentage (fixed right margin, Montserrat 22, faux-bold) */
