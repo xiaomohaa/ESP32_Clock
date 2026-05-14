@@ -175,6 +175,9 @@ static pcf85063a_dev_t s_rtc;
 
 static void rtc_init_dev(void)
 {
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
     esp_err_t ret = pcf85063a_init(&s_rtc, user_i2cbus.Get_I2cBusHandle(), PCF85063A_ADDRESS);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PCF85063A init failed (%d)", ret);
