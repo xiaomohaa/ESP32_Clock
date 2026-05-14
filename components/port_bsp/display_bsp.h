@@ -32,6 +32,7 @@ public:
     void DisplayPort_TouchInit(void);
     void Set_Backlight(uint8_t brightness);
     void Set_Rotate(uint8_t Rotate);
+    void Set_Madctl_Raw(uint8_t val);
 
     spi_host_device_t Get_SpiHost() { return spihost_; }
     esp_lcd_panel_handle_t Get_PanelHandle() { return panel_handle; }

@@ -34,7 +34,18 @@
       "Bash(git init *)",
       "Bash(git add *)",
       "Bash(git rm *)",
-      "Bash(git reset *)"
+      "Bash(git reset *)",
+      "Bash(git commit *)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(timeout 3 cat /dev/cu.usbmodem1101)",
+      "Bash(git status *)",
+      "Bash(timeout 8 cat /dev/cu.usbmodem1101)",
+      "Bash(stty -f /dev/cu.usbmodem1101 115200)",
+      "Bash(timeout 15 cat /dev/cu.usbmodem1101)",
+      "Bash(timeout 10 cat /dev/cu.usbmodem1101)",
+      "WebSearch",
+      "Bash(ps *)"
     ]
   }
 }

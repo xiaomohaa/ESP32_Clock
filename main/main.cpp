@@ -18,6 +18,7 @@
 #include "power_bsp.h"
 
 #define TAG "clock"
+#define MADCTL_TEST_MODE 0
 
 /* rainbow colors for time digits */
 static const char *s_rainbow_hex[] = {
@@ -289,7 +290,7 @@ static void clock_update_cb(lv_timer_t *timer)
 
     if (s_time_synced) {
         char tbuf[8];
-        snprintf(tbuf, sizeof(tbuf), "%02d : %02d", ti.tm_hour, ti.tm_min);
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d", ti.tm_hour, ti.tm_min);
         draw_rainbow_on_canvas(time_canvas, &lv_font_montserrat_48, TC_W, tbuf, ti.tm_sec, false);
 
         char sbuf[4];
@@ -524,6 +525,30 @@ static void clock_ui_init(void)
 
 static qmi8658_dev_t s_qmi8658;
 
+/* MADCTL test: cycle through candidate values, print to serial */
+#if MADCTL_TEST_MODE
+static void madctl_test_task(void *arg)
+{
+    static const uint8_t candidates[] = {
+        0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0, 0xF0, 0x30
+    };
+    int n = sizeof(candidates) / sizeof(candidates[0]);
+    int idx = 0;
+    vTaskDelay(pdMS_TO_TICKS(3000)); /* wait for display ready */
+    printf("=== MADCTL TEST START ===\n");
+    while (1) {
+        uint8_t val = candidates[idx];
+        if (Lvgl_lock(1000) == ESP_OK) {
+            user_display->Set_Madctl_Raw(val);
+            Lvgl_unlock();
+        }
+        printf("MADCTL TEST: 0x%02X (%d/%d)\n", val, idx + 1, n);
+        idx = (idx + 1) % n;
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+#endif
+
 static const char *rot_name(int r)
 {
     return (r == 0) ? "0-UP" : (r == 1) ? "1-RIGHT" : (r == 2) ? "2-DOWN" : "3-LEFT";
@@ -551,57 +576,75 @@ static void rotation_task(void *arg)
     int rot_count = 0;
     float sx = 0, sy = 0, sz = 0;
     int cnt = 0;
+    int loop = 0;
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(100));
+        loop++;
 
-        qmi8658_data_t data = {};
-        if (qmi8658_read_sensor_data(&s_qmi8658, &data) != ESP_OK) {
+        /* heartbeat every 3s */
+        if (loop % 30 == 0) {
+            printf("HB %d rot=%d\n", loop, cur_rot);
+        }
+
+        /* raw I2C read with timeout */
+        uint8_t reg = 0x35;
+        uint8_t buf[6];
+        esp_err_t err = i2c_master_transmit_receive(s_qmi8658.dev_handle, &reg, 1, buf, 6, 100);
+        if (err != ESP_OK) {
+            printf("I2C ERR=%d loop=%d\n", err, loop);
             continue;
         }
 
-        /* low-pass filter (α=0.3) */
-        sx = sx * 0.7f + data.accelX * 0.3f;
-        sy = sy * 0.7f + data.accelY * 0.3f;
-        sz = sz * 0.7f + data.accelZ * 0.3f;
+        int16_t raw_x = (int16_t)(buf[1] << 8 | buf[0]);
+        int16_t raw_y = (int16_t)(buf[3] << 8 | buf[2]);
+        int16_t raw_z = (int16_t)(buf[5] << 8 | buf[4]);
+
+        float ax_raw = raw_x * 9.8f / 4096.0f;
+        float ay_raw = raw_y * 9.8f / 4096.0f;
+        float az_raw = raw_z * 9.8f / 4096.0f;
+
+        sx = sx * 0.7f + ax_raw * 0.3f;
+        sy = sy * 0.7f + ay_raw * 0.3f;
+        sz = sz * 0.7f + az_raw * 0.3f;
 
         s_accel_x = sx;
         s_accel_y = sy;
         s_accel_z = sz;
 
-        /* 4-direction detection (threshold ~0.7g ≈ 6.87 m/s²) */
         float ax = fabsf(sx), ay = fabsf(sy);
         int new_rot = cur_rot;
         const char *dir = "hold";
 
         if (ax > 6.87f && ax > ay) {
-            new_rot = (sx > 0) ? 1 : 3;
-            dir = (sx > 0) ? "RIGHT" : "LEFT";
+            new_rot = (sx > 0) ? 3 : 1;
+            dir = (sx > 0) ? "R" : "L";
         } else if (ay > 6.87f && ay > ax) {
             new_rot = (sy > 0) ? 0 : 2;
-            dir = (sy > 0) ? "UP" : "DOWN";
+            dir = (sy > 0) ? "UP" : "DN";
         }
 
-        /* serial print every ~500ms */
+        /* print every 1s */
         if (++cnt >= 10) {
             cnt = 0;
-            if (new_rot != cur_rot) {
-                printf("X:%.2f Y:%.2f Z:%.2f | %s->%s %s [%d/3]\n",
-                       sx / 9.8f, sy / 9.8f, sz / 9.8f,
-                       rot_name(cur_rot), rot_name(new_rot), dir, rot_count + 1);
-            } else {
-                printf("X:%.2f Y:%.2f Z:%.2f | %s stay (%s)\n",
-                       sx / 9.8f, sy / 9.8f, sz / 9.8f,
-                       rot_name(cur_rot), dir);
-            }
+            printf("X:%.1f Y:%.1f Z:%.1f | %s %s rc=%d\n",
+                   sx / 9.8f, sy / 9.8f, sz / 9.8f,
+                   rot_name(cur_rot), dir, rot_count);
         }
 
         if (new_rot != cur_rot) {
             rot_count++;
             if (rot_count >= 3) {
+                printf(">>> ROT %s->%s\n", rot_name(cur_rot), rot_name(new_rot));
                 cur_rot = new_rot;
                 rot_count = 0;
-                user_display->Set_Rotate(cur_rot);
+                if (Lvgl_lock(1000) == ESP_OK) {
+                    user_display->Set_Rotate(cur_rot);
+                    Lvgl_unlock();
+                    printf("ROT DONE\n");
+                } else {
+                    printf("ROT LOCK FAIL\n");
+                }
             }
         } else {
             rot_count = 0;
@@ -661,4 +704,9 @@ extern "C" void app_main(void)
 
     /* auto-rotate from accelerometer */
     xTaskCreatePinnedToCore(rotation_task, "rotation", 8 * 1024, NULL, 3, NULL, 0);
+
+#if MADCTL_TEST_MODE
+    /* MADCTL test: cycles through candidate values every 3s */
+    xTaskCreatePinnedToCore(madctl_test_task, "madctl_test", 4 * 1024, NULL, 4, NULL, 0);
+#endif
 }
