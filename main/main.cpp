@@ -12,6 +12,7 @@
 #include <nvs_flash.h>
 
 #include "qmi8658.h"
+#include "pcf85063a.h"
 #include <math.h>
 #include "lvgl_bsp.h"
 #include "lvgl.h"
@@ -74,11 +75,11 @@ static lv_color_t wc_buf[WC_W * WC_H];
 static lv_obj_t *weekday_canvas;
 
 static lv_obj_t *wifi_label;
-static lv_obj_t *debug_label;
 static lv_obj_t *battery_canvas;
 static lv_obj_t *battery_pct_label;
 static lv_obj_t *battery_pct_shadow;
 static volatile bool s_time_synced = false;
+static volatile bool s_ntp_done = false;
 static volatile float s_accel_x, s_accel_y, s_accel_z;
 static lv_anim_t s_wifi_anim;
 
@@ -168,12 +169,64 @@ static void wifi_init_and_connect(void)
     ESP_LOGI(TAG, "WiFi init done, connecting to: %s", s_wifi_list[0].ssid);
 }
 
+/* ---------- PCF85063A RTC ---------- */
+
+static pcf85063a_dev_t s_rtc;
+
+static void rtc_init_dev(void)
+{
+    esp_err_t ret = pcf85063a_init(&s_rtc, user_i2cbus.Get_I2cBusHandle(), PCF85063A_ADDRESS);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "PCF85063A init failed (%d)", ret);
+        return;
+    }
+    ESP_LOGI(TAG, "PCF85063A OK");
+
+    /* read RTC time and set system clock */
+    pcf85063a_datetime_t dt = {};
+    pcf85063a_get_time_date(&s_rtc, &dt);
+    if (dt.year > 2020) {
+        struct tm ti = {};
+        ti.tm_year = dt.year - 1900;
+        ti.tm_mon  = dt.month - 1;
+        ti.tm_mday = dt.day;
+        ti.tm_hour = dt.hour;
+        ti.tm_min  = dt.min;
+        ti.tm_sec  = dt.sec;
+        time_t t = mktime(&ti);
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "RTC time: %04d-%02d-%02d %02d:%02d:%02d",
+                 dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec);
+        s_time_synced = true;
+    }
+}
+
+static void rtc_save_time(void)
+{
+    time_t now;
+    struct tm ti;
+    time(&now);
+    localtime_r(&now, &ti);
+    pcf85063a_datetime_t dt = {};
+    dt.year  = ti.tm_year + 1900;
+    dt.month = ti.tm_mon + 1;
+    dt.day   = ti.tm_mday;
+    dt.hour  = ti.tm_hour;
+    dt.min   = ti.tm_min;
+    dt.sec   = ti.tm_sec;
+    pcf85063a_set_time_date(&s_rtc, dt);
+    ESP_LOGI(TAG, "RTC saved: %04d-%02d-%02d %02d:%02d:%02d",
+             dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec);
+}
+
 /* ---------- SNTP ---------- */
 
 static void time_sync_notification_cb(struct timeval *tv)
 {
     ESP_LOGI(TAG, "NTP time synced");
     s_time_synced = true;
+    s_ntp_done = true;
 }
 
 static void sntp_init_and_wait(void)
@@ -187,19 +240,20 @@ static void sntp_init_and_wait(void)
     esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
     esp_sntp_init();
 
-    /* wait up to 30s for sync */
-    for (int i = 0; i < 30 && !s_time_synced; i++) {
+    /* wait up to 30s for NTP sync */
+    for (int i = 0; i < 30 && !s_ntp_done; i++) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    if (s_time_synced) {
+    if (s_ntp_done) {
         time_t now;
         struct tm ti;
         time(&now);
         localtime_r(&now, &ti);
-        ESP_LOGI(TAG, "time: %04d-%02d-%02d %02d:%02d:%02d",
+        ESP_LOGI(TAG, "NTP time: %04d-%02d-%02d %02d:%02d:%02d",
                  ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
                  ti.tm_hour, ti.tm_min, ti.tm_sec);
+        rtc_save_time();
     } else {
         ESP_LOGW(TAG, "NTP sync timeout, using uptime");
     }
@@ -324,11 +378,6 @@ static void clock_update_cb(lv_timer_t *timer)
     lv_obj_invalidate(sec_canvas);
     lv_obj_invalidate(date_canvas);
     lv_obj_invalidate(weekday_canvas);
-
-    /* update debug XYZ in g units (×100, so 1g = 100) */
-    lv_label_set_text_fmt(debug_label, "X:%d Y:%d Z:%d",
-                          (int)(s_accel_x * 10), (int)(s_accel_y * 10),
-                          (int)(s_accel_z * 10));
 }
 
 static void battery_canvas_redraw(int pct)
@@ -471,13 +520,6 @@ static void clock_ui_init(void)
     lv_img_set_pivot(weekday_canvas, 0, 0);
     lv_obj_align(weekday_canvas, LV_ALIGN_CENTER, -50, 200);
 
-    /* debug: XYZ accelerometer values */
-    debug_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(debug_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(debug_label, lv_color_make(0x80, 0x80, 0x80), 0);
-    lv_label_set_text(debug_label, "X:0.00 Y:0.00 Z:0.00");
-    lv_obj_align(debug_label, LV_ALIGN_CENTER, -80, 130);
-
     /* Right side: percentage | battery | WiFi (right to left) */
     /* Battery percentage (fixed right margin, Montserrat 22, faux-bold) */
     battery_pct_shadow = lv_label_create(scr);
@@ -559,10 +601,6 @@ static void rotation_task(void *arg)
     esp_err_t ret = qmi8658_init(&s_qmi8658, user_i2cbus.Get_I2cBusHandle(), QMI8658_ADDRESS_HIGH);
     if (ret != ESP_OK) {
         ESP_LOGE("rot", "QMI8658 init FAILED (%d)", ret);
-        if (Lvgl_lock(1000) == ESP_OK) {
-            lv_label_set_text(debug_label, "QMI INIT FAIL");
-            Lvgl_unlock();
-        }
         vTaskDelete(NULL);
         return;
     }
@@ -654,6 +692,36 @@ static void rotation_task(void *arg)
 
 /* ---------- status report ---------- */
 
+/* ---------- buttons ---------- */
+
+#define BTN_POWER   GPIO_NUM_18
+#define BTN_LEFT    GPIO_NUM_9
+#define BTN_RIGHT   GPIO_NUM_10
+#define BTN_LONG_PRESS_MS  2000
+
+static void button_task(void *arg)
+{
+    int hold_ms = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (gpio_get_level(BTN_POWER) == 1) {
+            hold_ms += 100;
+            if (hold_ms >= BTN_LONG_PRESS_MS) {
+                ESP_LOGW(TAG, "power long press -> shutdown");
+                if (Lvgl_lock(1000) == ESP_OK) {
+                    lv_obj_t *scr = lv_scr_act();
+                    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+                    Lvgl_unlock();
+                }
+                vTaskDelay(pdMS_TO_TICKS(200));
+                Axp2101_PowerOff();
+            }
+        } else {
+            hold_ms = 0;
+        }
+    }
+}
+
 static void status_report_task(void *arg)
 {
     while (1) {
@@ -684,8 +752,18 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "boot OK");
 
+    /* buttons: GPIO9=left, GPIO10=right, GPIO18=power */
+    gpio_config_t btn_cfg = {};
+    btn_cfg.pin_bit_mask = (1ULL << BTN_POWER) | (1ULL << BTN_LEFT) | (1ULL << BTN_RIGHT);
+    btn_cfg.mode = GPIO_MODE_INPUT;
+    btn_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    btn_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    btn_cfg.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&btn_cfg);
+
     /* hardware init */
     Custom_PmicPortInit(&user_i2cbus, 0x34);
+    rtc_init_dev();
     user_display = new DisplayPort(user_i2cbus, 480, 480);
     user_display->DisplayPort_TouchInit();
     Lvgl_PortInit(*user_display);
@@ -709,4 +787,7 @@ extern "C" void app_main(void)
     /* MADCTL test: cycles through candidate values every 3s */
     xTaskCreatePinnedToCore(madctl_test_task, "madctl_test", 4 * 1024, NULL, 4, NULL, 0);
 #endif
+
+    /* button monitor */
+    xTaskCreatePinnedToCore(button_task, "button", 2 * 1024, NULL, 3, NULL, 0);
 }

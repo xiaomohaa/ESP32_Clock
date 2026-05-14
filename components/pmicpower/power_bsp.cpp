@@ -139,3 +139,8 @@ int Axp2101_GetBatteryPercent(void) {
 bool Axp2101_IsCharging(void) {
     return axp2101.isCharging();
 }
+
+void Axp2101_PowerOff(void) {
+    ESP_LOGW(TAG, "Power off!");
+    axp2101.shutdown();
+}

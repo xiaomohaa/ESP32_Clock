@@ -8,7 +8,9 @@
 - **屏幕**: 2.16" AMOLED 480x480, SH8601 驱动, QSPI 接口
 - **触摸**: CST9217 电容触摸, I2C 接口
 - **传感器**: QMI8658 6轴 IMU (加速度计 + 陀螺仪), I2C 接口
+- **RTC**: PCF85063A 实时时钟, I2C 接口
 - **电源**: AXP2101 PMIC
+- **按键**: GPIO9 (左键), GPIO10 (右键), GPIO18 (电源键)
 
 ## 软件框架
 
@@ -17,6 +19,7 @@
 - **显示驱动**: `espressif/esp_lcd_sh8601`
 - **触摸驱动**: `waveshare/esp_lcd_touch_cst9217`
 - **IMU驱动**: `waveshare/qmi8658`
+- **RTC驱动**: `waveshare/pcf85063a`
 
 ## 功能
 
@@ -24,9 +27,11 @@
 - 日期 + 星期显示
 - WiFi 自动连接 (支持多网络切换)
 - NTP 时间同步 (ntp.aliyun.com)
+- PCF85063A RTC 时间持久化 (NTP 同步后写入 RTC，开机时从 RTC 恢复)
 - 电池电量显示 (带充电动画)
 - WiFi 状态图标 (连接后常亮，未连接闪烁)
-- **QMI8658 加速度计自动四方向旋转**
+- QMI8658 加速度计自动四方向旋转
+- 电源键长按 2 秒关机 (通过 AXP2101 PMIC)
 
 ## 关键设置
 
@@ -113,18 +118,32 @@ idf.py -p /dev/cu.usbmodem1101 flash
 idf.py -p /dev/cu.usbmodem1101 monitor
 ```
 
+## 按键功能
+
+| GPIO | 按键 | 功能 |
+|------|------|------|
+| 9    | 左键 | 暂未定义 |
+| 10   | 右键 | 暂未定义 |
+| 18   | 电源键 | 长按 2 秒关机 (AXP2101 PMIC) |
+
+按键为高电平有效（按下=1），已配置内部上拉。
+
 ## 项目结构
 
 ```
 ├── main/
-│   ├── main.cpp              # 主程序 (时钟UI, WiFi, NTP, 旋转任务)
+│   ├── main.cpp              # 主程序 (时钟UI, WiFi, NTP, RTC, 旋转, 按键)
 │   └── idf_component.yml     # 组件依赖声明
 ├── components/
-│   └── port_bsp/
-│       ├── display_bsp.cpp   # 显示驱动 (SPI, MADCTL旋转, 背光)
-│       ├── display_bsp.h
-│       ├── i2c_bsp.cpp       # I2C 总线初始化
-│       └── CMakeLists.txt
+│   ├── port_bsp/
+│   │   ├── display_bsp.cpp   # 显示驱动 (SPI, MADCTL旋转, 背光)
+│   │   ├── display_bsp.h
+│   │   ├── i2c_bsp.cpp       # I2C 总线初始化
+│   │   └── CMakeLists.txt
+│   └── pmicpower/
+│       ├── power_bsp.cpp     # AXP2101 PMIC 驱动 (充电, 电量, 关机)
+│       ├── power_bsp.h
+│       └── src/              # XPowersLib 源码
 ├── managed_components/       # 自动下载的组件 (不提交到git)
 └── build/                    # 编译输出 (不提交到git)
 ```
@@ -132,5 +151,5 @@ idf.py -p /dev/cu.usbmodem1101 monitor
 ## 注意事项
 
 - `qmi8658.h` 会重定义 `M_PI`，需在 `#include "qmi8658.h"` 之后再 `#include <math.h>`
-- ESP-IDF v6.0.1 的 I2C 驱动拆分到了 `esp_driver_i2c`，waveshare 组件需手动修改 CMakeLists.txt 添加依赖
+- ESP-IDF v6.0.1 的 I2C 驱动拆分到了 `esp_driver_i2c`，waveshare 组件需手动修改 `CMakeLists.txt` 添加依赖（`qmi8658` 和 `pcf85063a` 都需要）
 - `managed_components/` 目录由 idf_component_manager 自动管理，无需提交到 git

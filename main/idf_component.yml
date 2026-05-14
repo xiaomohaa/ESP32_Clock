@@ -8,3 +8,4 @@ dependencies:
   waveshare/esp_lcd_touch_cst9217: ^1.0.4
   espressif/esp_lvgl_adapter: ^0.3.0
   waveshare/qmi8658: ^1.0.1
+  waveshare/pcf85063a: ^1.1.1
