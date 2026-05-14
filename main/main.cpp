@@ -11,6 +11,8 @@
 #include <esp_sntp.h>
 #include <nvs_flash.h>
 
+#include "qmi8658.h"
+#include <math.h>
 #include "lvgl_bsp.h"
 #include "lvgl.h"
 #include "power_bsp.h"
@@ -71,10 +73,12 @@ static lv_color_t wc_buf[WC_W * WC_H];
 static lv_obj_t *weekday_canvas;
 
 static lv_obj_t *wifi_label;
+static lv_obj_t *debug_label;
 static lv_obj_t *battery_canvas;
 static lv_obj_t *battery_pct_label;
 static lv_obj_t *battery_pct_shadow;
 static volatile bool s_time_synced = false;
+static volatile float s_accel_x, s_accel_y, s_accel_z;
 static lv_anim_t s_wifi_anim;
 
 /* battery canvas: 44x22 px, rounded style */
@@ -319,6 +323,11 @@ static void clock_update_cb(lv_timer_t *timer)
     lv_obj_invalidate(sec_canvas);
     lv_obj_invalidate(date_canvas);
     lv_obj_invalidate(weekday_canvas);
+
+    /* update debug XYZ in g units (×100, so 1g = 100) */
+    lv_label_set_text_fmt(debug_label, "X:%d Y:%d Z:%d",
+                          (int)(s_accel_x * 10), (int)(s_accel_y * 10),
+                          (int)(s_accel_z * 10));
 }
 
 static void battery_canvas_redraw(int pct)
@@ -461,6 +470,13 @@ static void clock_ui_init(void)
     lv_img_set_pivot(weekday_canvas, 0, 0);
     lv_obj_align(weekday_canvas, LV_ALIGN_CENTER, -50, 200);
 
+    /* debug: XYZ accelerometer values */
+    debug_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(debug_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(debug_label, lv_color_make(0x80, 0x80, 0x80), 0);
+    lv_label_set_text(debug_label, "X:0.00 Y:0.00 Z:0.00");
+    lv_obj_align(debug_label, LV_ALIGN_CENTER, -80, 130);
+
     /* Right side: percentage | battery | WiFi (right to left) */
     /* Battery percentage (fixed right margin, Montserrat 22, faux-bold) */
     battery_pct_shadow = lv_label_create(scr);
@@ -502,6 +518,95 @@ static void clock_ui_init(void)
     /* first update immediately */
     clock_update_cb(NULL);
     status_bar_update_cb(NULL);
+}
+
+/* ---------- auto-rotate via accelerometer ---------- */
+
+static qmi8658_dev_t s_qmi8658;
+
+static const char *rot_name(int r)
+{
+    return (r == 0) ? "0-UP" : (r == 1) ? "1-RIGHT" : (r == 2) ? "2-DOWN" : "3-LEFT";
+}
+
+static void rotation_task(void *arg)
+{
+    esp_err_t ret = qmi8658_init(&s_qmi8658, user_i2cbus.Get_I2cBusHandle(), QMI8658_ADDRESS_HIGH);
+    if (ret != ESP_OK) {
+        ESP_LOGE("rot", "QMI8658 init FAILED (%d)", ret);
+        if (Lvgl_lock(1000) == ESP_OK) {
+            lv_label_set_text(debug_label, "QMI INIT FAIL");
+            Lvgl_unlock();
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
+    qmi8658_set_accel_range(&s_qmi8658, QMI8658_ACCEL_RANGE_8G);
+    qmi8658_set_accel_odr(&s_qmi8658, QMI8658_ACCEL_ODR_500HZ);
+    qmi8658_set_accel_unit_mps2(&s_qmi8658, true);
+    ESP_LOGI("rot", "QMI8658 OK, 8G 500Hz m/s²");
+
+    int cur_rot = 0;
+    int rot_count = 0;
+    float sx = 0, sy = 0, sz = 0;
+    int cnt = 0;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        qmi8658_data_t data = {};
+        if (qmi8658_read_sensor_data(&s_qmi8658, &data) != ESP_OK) {
+            continue;
+        }
+
+        /* low-pass filter (α=0.3) */
+        sx = sx * 0.7f + data.accelX * 0.3f;
+        sy = sy * 0.7f + data.accelY * 0.3f;
+        sz = sz * 0.7f + data.accelZ * 0.3f;
+
+        s_accel_x = sx;
+        s_accel_y = sy;
+        s_accel_z = sz;
+
+        /* 4-direction detection (threshold ~0.7g ≈ 6.87 m/s²) */
+        float ax = fabsf(sx), ay = fabsf(sy);
+        int new_rot = cur_rot;
+        const char *dir = "hold";
+
+        if (ax > 6.87f && ax > ay) {
+            new_rot = (sx > 0) ? 1 : 3;
+            dir = (sx > 0) ? "RIGHT" : "LEFT";
+        } else if (ay > 6.87f && ay > ax) {
+            new_rot = (sy > 0) ? 0 : 2;
+            dir = (sy > 0) ? "UP" : "DOWN";
+        }
+
+        /* serial print every ~500ms */
+        if (++cnt >= 10) {
+            cnt = 0;
+            if (new_rot != cur_rot) {
+                printf("X:%.2f Y:%.2f Z:%.2f | %s->%s %s [%d/3]\n",
+                       sx / 9.8f, sy / 9.8f, sz / 9.8f,
+                       rot_name(cur_rot), rot_name(new_rot), dir, rot_count + 1);
+            } else {
+                printf("X:%.2f Y:%.2f Z:%.2f | %s stay (%s)\n",
+                       sx / 9.8f, sy / 9.8f, sz / 9.8f,
+                       rot_name(cur_rot), dir);
+            }
+        }
+
+        if (new_rot != cur_rot) {
+            rot_count++;
+            if (rot_count >= 3) {
+                cur_rot = new_rot;
+                rot_count = 0;
+                user_display->Set_Rotate(cur_rot);
+            }
+        } else {
+            rot_count = 0;
+        }
+    }
 }
 
 /* ---------- status report ---------- */
@@ -553,4 +658,7 @@ extern "C" void app_main(void)
 
     /* periodic status */
     xTaskCreatePinnedToCore(status_report_task, "status", 2 * 1024, NULL, 2, NULL, 0);
+
+    /* auto-rotate from accelerometer */
+    xTaskCreatePinnedToCore(rotation_task, "rotation", 8 * 1024, NULL, 3, NULL, 0);
 }

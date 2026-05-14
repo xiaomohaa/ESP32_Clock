@@ -122,16 +122,17 @@ void DisplayPort::Set_Backlight(uint8_t brightness) {
 }
 
 void DisplayPort::Set_Rotate(uint8_t Rotate) {
-    uint8_t rot = 0x00;
     uint32_t CMD = 0x36;
     CMD &= 0xFF;
     CMD <<= 8;
     CMD |= 0x02 << 24;
-    if(Rotate == 1) {
-        rot = 0x30;
-    }
-    else {
-        rot = 0x00;
-    }
-    esp_lcd_panel_io_tx_param(io_handle, CMD, &rot,1);
+    /* MADCTL values for 4 orientations:
+     * 0: 0x30 (normal)
+     * 1: 0x00 (90°)
+     * 2: 0xF0 (180°)
+     * 3: 0x60 (270°)
+     */
+    static const uint8_t madctl[] = { 0x30, 0x00, 0xF0, 0x60 };
+    uint8_t rot = (Rotate < 4) ? madctl[Rotate] : 0x30;
+    esp_lcd_panel_io_tx_param(io_handle, CMD, &rot, 1);
 }
