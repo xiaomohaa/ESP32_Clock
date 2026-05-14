@@ -1,0 +1,496 @@
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_netif.h>
+#include <esp_sntp.h>
+#include <nvs_flash.h>
+
+#include "lvgl_bsp.h"
+#include "lvgl.h"
+#include "power_bsp.h"
+
+#define TAG "clock"
+
+/* rainbow colors for time digits */
+static const char *s_rainbow_hex[] = {
+    "ff0000","ff8000","ffff00","00ff00",
+    "00ffff","0080ff","8000ff","ff00ff","ff0080",
+};
+#define RAINBOW_N 9
+
+/* WiFi networks - try in order */
+typedef struct {
+    const char *ssid;
+    const char *password;
+} wifi_credential_t;
+
+static const wifi_credential_t s_wifi_list[] = {
+    { "GX_T",   "ap119119" },
+    { "LAB721", "lab721721" },
+};
+#define WIFI_LIST_SIZE (sizeof(s_wifi_list) / sizeof(s_wifi_list[0]))
+
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT       BIT1
+static int s_current_wifi_idx = 0;
+static int s_retry_count = 0;
+#define WIFI_MAX_RETRY_PER_NET  3
+
+I2cMasterBus user_i2cbus(7, 8, 0);
+DisplayPort *user_display = NULL;
+
+static lv_obj_t *time_label;
+static lv_obj_t *sec_label;
+static lv_obj_t *date_label;
+static lv_obj_t *weekday_label;
+static lv_obj_t *wifi_label;
+static lv_obj_t *battery_canvas;
+static lv_obj_t *battery_pct_label;
+static lv_obj_t *battery_pct_shadow;
+static volatile bool s_time_synced = false;
+static lv_anim_t s_wifi_anim;
+
+/* battery canvas: 44x22 px, rounded style */
+#define BAT_W  44
+#define BAT_H  22
+#define BAT_NUB_W 4
+#define BAT_BORDER 2
+#define BAT_RADIUS 5
+static lv_color_t bat_canvas_buf[BAT_W * BAT_H];
+
+/* ---------- WiFi ---------- */
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_count < WIFI_MAX_RETRY_PER_NET) {
+            esp_wifi_connect();
+            s_retry_count++;
+            ESP_LOGW(TAG, "retry WiFi [%s] (%d/%d)",
+                     s_wifi_list[s_current_wifi_idx].ssid,
+                     s_retry_count, WIFI_MAX_RETRY_PER_NET);
+        } else {
+            /* try next network */
+            s_current_wifi_idx++;
+            if (s_current_wifi_idx < (int)WIFI_LIST_SIZE) {
+                s_retry_count = 0;
+                wifi_config_t cfg = {};
+                strlcpy((char *)cfg.sta.ssid,
+                        s_wifi_list[s_current_wifi_idx].ssid,
+                        sizeof(cfg.sta.ssid));
+                strlcpy((char *)cfg.sta.password,
+                        s_wifi_list[s_current_wifi_idx].password,
+                        sizeof(cfg.sta.password));
+                cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+                ESP_LOGI(TAG, "trying next WiFi: %s",
+                         s_wifi_list[s_current_wifi_idx].ssid);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGE(TAG, "all WiFi networks failed");
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            }
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "WiFi connected: %s  IP: " IPSTR,
+                 s_wifi_list[s_current_wifi_idx].ssid,
+                 IP2STR(&ev->ip_info.ip));
+        s_retry_count = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_and_connect(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t any_id, got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &got_ip));
+
+    /* start with first network */
+    wifi_config_t wifi_cfg = {};
+    strlcpy((char *)wifi_cfg.sta.ssid,
+            s_wifi_list[0].ssid, sizeof(wifi_cfg.sta.ssid));
+    strlcpy((char *)wifi_cfg.sta.password,
+            s_wifi_list[0].password, sizeof(wifi_cfg.sta.password));
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi init done, connecting to: %s", s_wifi_list[0].ssid);
+}
+
+/* ---------- SNTP ---------- */
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "NTP time synced");
+    s_time_synced = true;
+}
+
+static void sntp_init_and_wait(void)
+{
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+
+    /* wait up to 30s for sync */
+    for (int i = 0; i < 30 && !s_time_synced; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (s_time_synced) {
+        time_t now;
+        struct tm ti;
+        time(&now);
+        localtime_r(&now, &ti);
+        ESP_LOGI(TAG, "time: %04d-%02d-%02d %02d:%02d:%02d",
+                 ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                 ti.tm_hour, ti.tm_min, ti.tm_sec);
+    } else {
+        ESP_LOGW(TAG, "NTP sync timeout, using uptime");
+    }
+}
+
+/* background task: WiFi -> NTP -> done */
+static void time_sync_task(void *arg)
+{
+    wifi_init_and_connect();
+
+    /* wait for connection or failure */
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        sntp_init_and_wait();
+    } else {
+        ESP_LOGW(TAG, "WiFi not available, clock shows uptime");
+    }
+
+    vTaskDelete(NULL);
+}
+
+/* ---------- LVGL clock UI ---------- */
+
+static const char *weekday_en(int wday)
+{
+    static const char *names[] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday",
+        "Thursday", "Friday", "Saturday"
+    };
+    return (wday >= 0 && wday <= 6) ? names[wday] : "???";
+}
+
+static void set_rainbow_text(lv_obj_t *lbl, const char *text, int shift)
+{
+    char buf[256];
+    int off = 0;
+    int len = strlen(text);
+    for (int i = 0; i < len && off < (int)sizeof(buf) - 20; i++) {
+        int ci = (i + shift) % RAINBOW_N;
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "#%s %c# ", s_rainbow_hex[ci], text[i]);
+    }
+    buf[off] = '\0';
+    lv_label_set_text(lbl, buf);
+}
+
+static void clock_update_cb(lv_timer_t *timer)
+{
+    time_t now;
+    struct tm ti;
+    time(&now);
+    localtime_r(&now, &ti);
+
+    if (s_time_synced) {
+        char tbuf[16], sbuf[8];
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d", ti.tm_hour, ti.tm_min);
+        snprintf(sbuf, sizeof(sbuf), "%02d", ti.tm_sec);
+        set_rainbow_text(time_label, tbuf, ti.tm_sec);
+        set_rainbow_text(sec_label, sbuf, ti.tm_sec);
+        lv_label_set_text_fmt(date_label, "%04d-%02d-%02d",
+                              ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+        lv_label_set_text(weekday_label, weekday_en(ti.tm_wday));
+    } else {
+        int total_sec = (int)(esp_timer_get_time() / 1000000);
+        int sec = total_sec % 60;
+        char tbuf[16], sbuf[8];
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d",
+                 total_sec / 3600, (total_sec % 3600) / 60);
+        snprintf(sbuf, sizeof(sbuf), "%02d", sec);
+        set_rainbow_text(time_label, tbuf, sec);
+        set_rainbow_text(sec_label, sbuf, sec);
+        lv_label_set_text(date_label, "--");
+        lv_label_set_text(weekday_label, "--");
+    }
+}
+
+static void battery_canvas_redraw(int pct)
+{
+    lv_color_t white = lv_color_white();
+    lv_color_t red   = lv_color_make(0xFF, 0x00, 0x00);
+    lv_color_t black = lv_color_black();
+
+    lv_canvas_fill_bg(battery_canvas, black, LV_OPA_COVER);
+
+    int body_w = BAT_W - BAT_NUB_W;
+    int inner_x = BAT_BORDER;
+    int inner_y = BAT_BORDER;
+    int inner_w = body_w - BAT_BORDER * 2;
+    int inner_h = BAT_H - BAT_BORDER * 2;
+
+    /* battery body: rounded outline */
+    lv_draw_rect_dsc_t border_dsc;
+    lv_draw_rect_dsc_init(&border_dsc);
+    border_dsc.bg_opa      = LV_OPA_TRANSP;
+    border_dsc.border_color = white;
+    border_dsc.border_width = BAT_BORDER;
+    border_dsc.border_opa   = LV_OPA_COVER;
+    border_dsc.radius       = BAT_RADIUS;
+    lv_canvas_draw_rect(battery_canvas, 0, 0, body_w, BAT_H, &border_dsc);
+
+    /* terminal nub (right side, rounded) */
+    lv_draw_rect_dsc_t nub_dsc;
+    lv_draw_rect_dsc_init(&nub_dsc);
+    nub_dsc.bg_color  = white;
+    nub_dsc.bg_opa    = LV_OPA_COVER;
+    nub_dsc.border_opa = LV_OPA_TRANSP;
+    nub_dsc.radius    = 2;
+    int nub_h = BAT_H / 3;
+    int nub_y = (BAT_H - nub_h) / 2;
+    lv_canvas_draw_rect(battery_canvas, body_w, nub_y, BAT_NUB_W, nub_h, &nub_dsc);
+
+    /* fill bar: rounded, white when >= 20%, red when < 20% */
+    if (pct > 0) {
+        int fill_w = (inner_w * pct) / 100;
+        if (fill_w < 1) fill_w = 1;
+        lv_draw_rect_dsc_t fill_dsc;
+        lv_draw_rect_dsc_init(&fill_dsc);
+        fill_dsc.bg_color  = (pct >= 20) ? white : red;
+        fill_dsc.bg_opa    = LV_OPA_COVER;
+        fill_dsc.border_opa = LV_OPA_TRANSP;
+        fill_dsc.radius    = (fill_w >= inner_w) ? BAT_RADIUS - 1 : 2;
+        lv_canvas_draw_rect(battery_canvas, inner_x, inner_y, fill_w, inner_h, &fill_dsc);
+    }
+
+    /* charging: green lightning bolt */
+    if (Axp2101_IsCharging() && pct >= 0) {
+        lv_color_t green = lv_color_make(0x00, 0xFF, 0x00);
+        lv_draw_label_dsc_t lbl_dsc;
+        lv_draw_label_dsc_init(&lbl_dsc);
+        lbl_dsc.color = green;
+        lv_canvas_draw_text(battery_canvas,
+            body_w / 2 - 5, BAT_H / 2 - 7, 16, &lbl_dsc, LV_SYMBOL_CHARGE);
+    }
+}
+
+static void wifi_blink_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+
+static void wifi_anim_ready_cb(lv_anim_t *a)
+{
+    /* restart if still not connected */
+    if (!s_time_synced) {
+        lv_anim_start(&s_wifi_anim);
+    }
+}
+
+static void status_bar_update_cb(lv_timer_t *timer)
+{
+    /* WiFi icon: solid when connected, blinking when not */
+    if (s_time_synced) {
+        lv_anim_del(wifi_label, NULL);
+        lv_obj_set_style_opa(wifi_label, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(wifi_label, lv_color_white(), 0);
+    } else {
+        if (lv_anim_get(wifi_label, NULL) == NULL) {
+            lv_anim_start(&s_wifi_anim);
+        }
+    }
+
+    /* Battery canvas + percentage (with bold shadow) */
+    int pct = Axp2101_GetBatteryPercent();
+    battery_canvas_redraw(pct >= 0 ? pct : 0);
+
+    if (pct >= 0) {
+        lv_label_set_text_fmt(battery_pct_label, "%d%%", pct);
+        lv_label_set_text_fmt(battery_pct_shadow, "%d%%", pct);
+    } else {
+        lv_label_set_text(battery_pct_label, "--");
+        lv_label_set_text(battery_pct_shadow, "--");
+    }
+
+    /* dynamic layout: battery left of percentage, WiFi left of battery */
+    lv_obj_align_to(battery_pct_shadow, battery_pct_label, LV_ALIGN_TOP_LEFT, -1, -1);
+    lv_obj_align_to(battery_canvas, battery_pct_label, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+    lv_obj_align_to(wifi_label, battery_canvas, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+}
+
+static void clock_ui_init(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_make(0x10, 0x10, 0x10), 0);
+
+    /* time: Montserrat 48, rainbow recolor, no shadow */
+    time_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_48, 0);
+    lv_label_set_recolor(time_label, true);
+    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
+    lv_label_set_text(time_label, "00:00");
+    lv_obj_align(time_label, LV_ALIGN_CENTER, 0, -60);
+
+    /* seconds: Montserrat 20, rainbow recolor, right of time */
+    sec_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(sec_label, &lv_font_montserrat_20, 0);
+    lv_label_set_recolor(sec_label, true);
+    lv_obj_set_style_text_color(sec_label, lv_color_white(), 0);
+    lv_label_set_text(sec_label, "00");
+    lv_obj_align_to(sec_label, time_label, LV_ALIGN_OUT_RIGHT_MID, 24, 8);
+
+    /* date: glow */
+    date_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(date_label, lv_color_white(), 0);
+    lv_obj_set_style_shadow_color(date_label, lv_color_make(0x40, 0x80, 0xFF), 0);
+    lv_obj_set_style_shadow_width(date_label, 15, 0);
+    lv_obj_set_style_shadow_spread(date_label, 3, 0);
+    lv_obj_set_style_shadow_opa(date_label, LV_OPA_40, 0);
+    lv_label_set_text(date_label, "--");
+    lv_obj_align_to(date_label, sec_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+
+    /* weekday: English, glow */
+    weekday_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(weekday_label, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_set_style_shadow_color(weekday_label, lv_color_make(0x40, 0x80, 0xFF), 0);
+    lv_obj_set_style_shadow_width(weekday_label, 10, 0);
+    lv_obj_set_style_shadow_spread(weekday_label, 2, 0);
+    lv_obj_set_style_shadow_opa(weekday_label, LV_OPA_30, 0);
+    lv_label_set_text(weekday_label, "--");
+    lv_obj_align_to(weekday_label, date_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    /* Right side: percentage | battery | WiFi (right to left) */
+    /* Battery percentage (fixed right margin, Montserrat 22, faux-bold) */
+    battery_pct_shadow = lv_label_create(scr);
+    lv_obj_set_style_text_font(battery_pct_shadow, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(battery_pct_shadow, lv_color_white(), 0);
+    lv_label_set_text(battery_pct_shadow, "");
+    lv_obj_align(battery_pct_shadow, LV_ALIGN_TOP_RIGHT, -34, 9);
+
+    battery_pct_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(battery_pct_label, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(battery_pct_label, lv_color_white(), 0);
+    lv_label_set_text(battery_pct_label, "");
+    lv_obj_align(battery_pct_label, LV_ALIGN_TOP_RIGHT, -35, 8);
+
+    /* Battery canvas (positioned dynamically relative to percentage) */
+    battery_canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(battery_canvas, bat_canvas_buf, BAT_W, BAT_H, LV_IMG_CF_TRUE_COLOR);
+
+    /* WiFi icon (positioned dynamically relative to battery canvas) */
+    wifi_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(wifi_label, lv_color_white(), 0);
+    lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
+
+    /* setup WiFi blink animation (255→0→255, 800ms cycle) */
+    lv_anim_init(&s_wifi_anim);
+    lv_anim_set_var(&s_wifi_anim, wifi_label);
+    lv_anim_set_values(&s_wifi_anim, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&s_wifi_anim, 500);
+    lv_anim_set_playback_time(&s_wifi_anim, 500);
+    lv_anim_set_repeat_count(&s_wifi_anim, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_ready_cb(&s_wifi_anim, wifi_anim_ready_cb);
+    lv_anim_set_exec_cb(&s_wifi_anim, (lv_anim_exec_xcb_t)wifi_blink_cb);
+
+    /* Timers */
+    lv_timer_create(clock_update_cb, 1000, NULL);
+    lv_timer_create(status_bar_update_cb, 10000, NULL);
+
+    /* first update immediately */
+    clock_update_cb(NULL);
+    status_bar_update_cb(NULL);
+}
+
+/* ---------- status report ---------- */
+
+static void status_report_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        time_t now;
+        struct tm ti;
+        time(&now);
+        localtime_r(&now, &ti);
+        ESP_LOGI(TAG, "synced=%d time=%02d:%02d:%02d heap=%lu",
+                 s_time_synced,
+                 ti.tm_hour, ti.tm_min, ti.tm_sec,
+                 (unsigned long)esp_get_free_heap_size());
+    }
+}
+
+/* ---------- main ---------- */
+
+extern "C" void app_main(void)
+{
+    /* NVS required for WiFi */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_LOGI(TAG, "boot OK");
+
+    /* hardware init */
+    Custom_PmicPortInit(&user_i2cbus, 0x34);
+    user_display = new DisplayPort(user_i2cbus, 480, 480);
+    user_display->DisplayPort_TouchInit();
+    Lvgl_PortInit(*user_display);
+
+    /* clock UI */
+    if (Lvgl_lock(-1) == ESP_OK) {
+        clock_ui_init();
+        Lvgl_unlock();
+    }
+
+    /* WiFi + NTP in background */
+    xTaskCreatePinnedToCore(time_sync_task, "time_sync", 6 * 1024, NULL, 5, NULL, 0);
+
+    /* periodic status */
+    xTaskCreatePinnedToCore(status_report_task, "status", 2 * 1024, NULL, 2, NULL, 0);
+}

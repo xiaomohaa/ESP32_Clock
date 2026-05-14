@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(system_profiler SPUSBDataType)",
+      "Read(//Users/guangxin/**)",
+      "Bash(brew list *)",
+      "Bash(brew install *)",
+      "Bash(git clone *)",
+      "Bash(./install.sh esp32c6 *)",
+      "Bash(idf.py build *)",
+      "Bash(/Users/guangxin/.espressif/python_env/idf6.1_py3.12_env/bin/python *)",
+      "Bash(bash *)",
+      "Bash(git stash *)",
+      "Bash(git checkout *)",
+      "Bash(git submodule *)",
+      "Bash(/Users/guangxin/esp/esp-idf/install.sh esp32c6 *)",
+      "Bash(timeout 10 python3 -m serial.tools.miniterm /dev/cu.usbmodem1101 115200)",
+      "Bash(python3 *)",
+      "Bash(/Users/guangxin/.espressif/python_env/idf6.0_py3.12_env/bin/python *)",
+      "Bash(idf.py *)",
+      "Bash(zsh *)",
+      "Bash(export IDF_PATH=/Users/guangxin/.espressif/v6.0.1/esp-idf)",
+      "Bash(export IDF_PYTHON_ENV_PATH=/Users/guangxin/.espressif/python_env/idf6.0_py3.12_env)",
+      "Bash(export PATH=\"/Users/guangxin/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/bin:/Users/guangxin/.espressif/tools/esp32ulp-elf/2.38_20240113/esp32ulp-elf/bin:/Users/guangxin/.espressif/tools/openocd-esp32/v0.12.0-esp32-20260304/openocd-esp32/bin:/Users/guangxin/.espressif/tools/esp-rom-elfs/20241011/esp32c6/rom/bin:$PATH\")",
+      "Bash(pdftoppm -v)",
+      "Bash(pdftoppm *)",
+      "Bash(stty -f /dev/cu.usbmodem1101 115200 raw -echo)",
+      "Read(//dev/**)",
+      "Bash(/Users/guangxin/.espressif/python_env/idf6.0_py3.12_env/bin/python3 *)",
+      "Bash(xargs -I {} fc-query --format='%{family}\\\\n' {})",
+      "Bash(npm list *)",
+      "Bash(npx lv_font_conv --version)",
+      "Bash(npx lv_font_conv *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git rm *)",
+      "Bash(git reset *)"
+    ]
+  }
+}
