@@ -78,6 +78,7 @@ static lv_obj_t *wifi_label;
 static lv_obj_t *battery_canvas;
 static lv_obj_t *battery_pct_label;
 static lv_obj_t *battery_pct_shadow;
+static lv_obj_t *brightness_label;
 static volatile bool s_time_synced = false;
 static volatile bool s_ntp_done = false;
 static volatile float s_accel_x, s_accel_y, s_accel_z;
@@ -457,6 +458,9 @@ static void wifi_anim_ready_cb(lv_anim_t *a)
 
 static void status_bar_update_cb(lv_timer_t *timer)
 {
+    /* brightness */
+    lv_label_set_text_fmt(brightness_label, "B:%d", user_display->Get_Brightness());
+
     /* WiFi icon: solid when connected, blinking when not */
     if (s_time_synced) {
         lv_anim_del(wifi_label, NULL);
@@ -556,6 +560,13 @@ static void clock_ui_init(void)
     lv_anim_set_repeat_count(&s_wifi_anim, LV_ANIM_REPEAT_INFINITE);
     lv_anim_set_ready_cb(&s_wifi_anim, wifi_anim_ready_cb);
     lv_anim_set_exec_cb(&s_wifi_anim, (lv_anim_exec_xcb_t)wifi_blink_cb);
+
+    /* brightness indicator (top-left) */
+    brightness_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(brightness_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(brightness_label, lv_color_make(0x80, 0x80, 0x80), 0);
+    lv_label_set_text(brightness_label, "B:100");
+    lv_obj_align(brightness_label, LV_ALIGN_TOP_LEFT, 5, 5);
 
     /* Timers */
     lv_timer_create(clock_update_cb, 1000, NULL);
@@ -668,9 +679,10 @@ static void rotation_task(void *arg)
         /* print every 1s */
         if (++cnt >= 10) {
             cnt = 0;
-            printf("X:%.1f Y:%.1f Z:%.1f | %s %s rc=%d\n",
+            printf("X:%.1f Y:%.1f Z:%.1f | %s %s rc=%d bl=%d\n",
                    sx / 9.8f, sy / 9.8f, sz / 9.8f,
-                   rot_name(cur_rot), dir, rot_count);
+                   rot_name(cur_rot), dir, rot_count,
+                   user_display->Get_Brightness());
         }
 
         if (new_rot != cur_rot) {
@@ -704,11 +716,22 @@ static void rotation_task(void *arg)
 
 static void button_task(void *arg)
 {
-    int hold_ms = 0;
+    int hold_ms = 0, pwr_release = 0;
+    int left_hold = 0, right_hold = 0, left_release = 0, right_release = 0;
+    int brightness = 100;
+    ESP_LOGI(TAG, "button task started");
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (gpio_get_level(BTN_POWER) == 1) {
-            hold_ms += 100;
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        int pwr = gpio_get_level(BTN_POWER);
+        int btn_l = gpio_get_level(BTN_LEFT);
+        int btn_r = gpio_get_level(BTN_RIGHT);
+
+        /* power: long press 2s shutdown (debounce: need 3x release to reset) */
+        if (pwr == 1) {
+            pwr_release = 0;
+            hold_ms += 50;
             if (hold_ms >= BTN_LONG_PRESS_MS) {
                 ESP_LOGW(TAG, "power long press -> shutdown");
                 if (Lvgl_lock(1000) == ESP_OK) {
@@ -720,7 +743,52 @@ static void button_task(void *arg)
                 Axp2101_PowerOff();
             }
         } else {
-            hold_ms = 0;
+            if (++pwr_release >= 3) {
+                hold_ms = 0;
+                pwr_release = 0;
+            }
+        }
+
+        /* left: brightness down (active low) */
+        if (btn_l == 0) {
+            left_release = 0;
+            left_hold += 50;
+            if (left_hold >= 200) {
+                left_hold = -300;
+                brightness -= 10;
+                if (brightness < 0) brightness = 0;
+                user_display->Set_Backlight(brightness);
+                if (Lvgl_lock(100) == ESP_OK) {
+                    lv_label_set_text_fmt(brightness_label, "B:%d", brightness);
+                    Lvgl_unlock();
+                }
+            }
+        } else {
+            if (++left_release >= 3) {
+                left_hold = 0;
+                left_release = 0;
+            }
+        }
+
+        /* right: brightness up (active low) */
+        if (btn_r == 0) {
+            right_release = 0;
+            right_hold += 50;
+            if (right_hold >= 200) {
+                right_hold = -300;
+                brightness += 10;
+                if (brightness > 100) brightness = 100;
+                user_display->Set_Backlight(brightness);
+                if (Lvgl_lock(100) == ESP_OK) {
+                    lv_label_set_text_fmt(brightness_label, "B:%d", brightness);
+                    Lvgl_unlock();
+                }
+            }
+        } else {
+            if (++right_release >= 3) {
+                right_hold = 0;
+                right_release = 0;
+            }
         }
     }
 }
@@ -792,5 +860,5 @@ extern "C" void app_main(void)
 #endif
 
     /* button monitor */
-    xTaskCreatePinnedToCore(button_task, "button", 2 * 1024, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(button_task, "button", 4 * 1024, NULL, 3, NULL, 0);
 }
